@@ -24,6 +24,7 @@ func main() {
 	from := flag.String("from", "", "Source Redis URL (redis:// or rediss://)")
 	to := flag.String("to", "", "Destination Redis URL (redis:// or rediss://)")
 	workers := flag.Int("workers", 20, "Number of concurrent workers")
+	forceTypeBased := flag.Bool("type-based", false, "Force type-based sync instead of DUMP/RESTORE")
 	flag.Parse()
 
 	if *from == "" || *to == "" {
@@ -69,8 +70,11 @@ func main() {
 
 	fmt.Printf("Source Redis: %s, Destination Redis: %s\n", srcVersion, dstVersion)
 
-	// DUMP/RESTORE is incompatible across major Redis versions
-	if srcMajor != dstMajor {
+	// Use type-based sync if forced or if versions are incompatible
+	if *forceTypeBased {
+		fmt.Println("Using type-based sync (forced via -type-based flag)")
+		useTypeBasedSync = true
+	} else if srcMajor != dstMajor {
 		fmt.Printf("Warning: Redis major version mismatch (%d vs %d), using type-based sync\n", srcMajor, dstMajor)
 		useTypeBasedSync = true
 	}
