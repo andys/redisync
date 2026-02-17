@@ -8,12 +8,17 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/alitto/pond/v2"
 	"github.com/redis/go-redis/v9"
 )
+
+// useTypeBasedSync is set to true when Redis versions are incompatible for DUMP/RESTORE
+var useTypeBasedSync bool
 
 func main() {
 	from := flag.String("from", "", "Source Redis URL (redis:// or rediss://)")
@@ -41,12 +46,33 @@ func main() {
 	}
 	defer dstClient.Close()
 
-	// Test connections
+	// Test connections and check version compatibility
 	if err := srcClient.Ping(ctx).Err(); err != nil {
 		log.Fatalf("Failed to connect to source Redis: %v", err)
 	}
 	if err := dstClient.Ping(ctx).Err(); err != nil {
 		log.Fatalf("Failed to connect to destination Redis: %v", err)
+	}
+
+	// Check RDB version compatibility
+	srcVersion, err := getRedisVersion(ctx, srcClient)
+	if err != nil {
+		log.Fatalf("Failed to get source Redis version: %v", err)
+	}
+	dstVersion, err := getRedisVersion(ctx, dstClient)
+	if err != nil {
+		log.Fatalf("Failed to get destination Redis version: %v", err)
+	}
+
+	srcMajor := getMajorVersion(srcVersion)
+	dstMajor := getMajorVersion(dstVersion)
+
+	fmt.Printf("Source Redis: %s, Destination Redis: %s\n", srcVersion, dstVersion)
+
+	// DUMP/RESTORE is incompatible across major Redis versions
+	if srcMajor != dstMajor {
+		fmt.Printf("Warning: Redis major version mismatch (%d vs %d), using type-based sync\n", srcMajor, dstMajor)
+		useTypeBasedSync = true
 	}
 
 	// Get total key count
@@ -144,11 +170,38 @@ func parseRedisURL(rawURL string) (*redis.Client, error) {
 	return redis.NewClient(opts), nil
 }
 
+func getRedisVersion(ctx context.Context, client *redis.Client) (string, error) {
+	info, err := client.Info(ctx, "server").Result()
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(info, "\n") {
+		if strings.HasPrefix(line, "redis_version:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "redis_version:")), nil
+		}
+	}
+	return "", fmt.Errorf("redis_version not found in INFO")
+}
+
+func getMajorVersion(version string) int {
+	parts := strings.Split(version, ".")
+	if len(parts) > 0 {
+		major, _ := strconv.Atoi(parts[0])
+		return major
+	}
+	return 0
+}
+
 func syncKey(ctx context.Context, src, dst *redis.Client, key string) error {
 	// Get TTL
 	ttl, err := src.PTTL(ctx, key).Result()
 	if err != nil {
 		return fmt.Errorf("PTTL failed: %w", err)
+	}
+
+	// Use type-based sync if versions are incompatible
+	if useTypeBasedSync {
+		return syncKeyByType(ctx, src, dst, key, ttl)
 	}
 
 	// DUMP the key
@@ -172,6 +225,109 @@ func syncKey(ctx context.Context, src, dst *redis.Client, key string) error {
 	err = dst.RestoreReplace(ctx, key, restoreTTL, dump).Err()
 	if err != nil {
 		return fmt.Errorf("RESTORE failed: %w", err)
+	}
+
+	return nil
+}
+
+func syncKeyByType(ctx context.Context, src, dst *redis.Client, key string, ttl time.Duration) error {
+	keyType, err := src.Type(ctx, key).Result()
+	if err != nil {
+		return fmt.Errorf("TYPE failed: %w", err)
+	}
+
+	// Delete existing key first
+	dst.Del(ctx, key)
+
+	switch keyType {
+	case "string":
+		val, err := src.Get(ctx, key).Result()
+		if err != nil {
+			if err == redis.Nil {
+				return nil
+			}
+			return err
+		}
+		if err := dst.Set(ctx, key, val, 0).Err(); err != nil {
+			return err
+		}
+
+	case "list":
+		vals, err := src.LRange(ctx, key, 0, -1).Result()
+		if err != nil {
+			return err
+		}
+		if len(vals) > 0 {
+			if err := dst.RPush(ctx, key, vals).Err(); err != nil {
+				return err
+			}
+		}
+
+	case "set":
+		vals, err := src.SMembers(ctx, key).Result()
+		if err != nil {
+			return err
+		}
+		if len(vals) > 0 {
+			if err := dst.SAdd(ctx, key, vals).Err(); err != nil {
+				return err
+			}
+		}
+
+	case "zset":
+		vals, err := src.ZRangeWithScores(ctx, key, 0, -1).Result()
+		if err != nil {
+			return err
+		}
+		if len(vals) > 0 {
+			zs := make([]redis.Z, len(vals))
+			for i, v := range vals {
+				zs[i] = redis.Z{Score: v.Score, Member: v.Member}
+			}
+			if err := dst.ZAdd(ctx, key, zs...).Err(); err != nil {
+				return err
+			}
+		}
+
+	case "hash":
+		vals, err := src.HGetAll(ctx, key).Result()
+		if err != nil {
+			return err
+		}
+		if len(vals) > 0 {
+			if err := dst.HSet(ctx, key, vals).Err(); err != nil {
+				return err
+			}
+		}
+
+	case "stream":
+		// Read all stream entries
+		entries, err := src.XRange(ctx, key, "-", "+").Result()
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if err := dst.XAdd(ctx, &redis.XAddArgs{
+				Stream: key,
+				ID:     entry.ID,
+				Values: entry.Values,
+			}).Err(); err != nil {
+				return err
+			}
+		}
+
+	case "none":
+		return nil // Key was deleted
+
+	default:
+		return fmt.Errorf("unsupported key type: %s", keyType)
+	}
+
+	// Set TTL if applicable
+	if ttl > 0 {
+		if err := dst.PExpire(ctx, key, ttl).Err(); err != nil {
+			return err
+		}
 	}
 
 	return nil
