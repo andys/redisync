@@ -1,0 +1,80 @@
+name: Manual Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y upx-ucl
+
+      - name: Create output directory
+        run: mkdir -p dist
+
+      - name: Build Linux AMD64
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          go build \
+            -ldflags="-s -w -X main.version=${{ github.event.inputs.version }}" \
+            -o dist/redisync_linux_amd64 \
+            .
+          strip dist/redisync_linux_amd64
+          upx -q dist/redisync_linux_amd64
+
+      - name: Build Linux ARM64
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: arm64
+        run: |
+          go build \
+            -ldflags="-s -w -X main.version=${{ github.event.inputs.version }}" \
+            -o dist/redisync_linux_arm64 \
+            .
+          upx -q dist/redisync_linux_arm64
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum redisync_* > checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: Release ${{ github.event.inputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/redisync_linux_amd64
+            dist/redisync_linux_arm64
+            dist/checksums.txt
