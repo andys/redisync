@@ -12,8 +12,10 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/alitto/pond/v2"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -331,6 +333,12 @@ func readFromRedis(ctx context.Context, rawURL string, out chan<- RedisRecord, c
 		return nil
 	}
 
+	// Create a pool of workers for reading keys concurrently
+	pool := pond.NewPool(20)
+	defer pool.StopAndWait()
+
+	var atomicCount int64
+
 	// Scan all keys
 	var cursor uint64
 	for {
@@ -340,16 +348,19 @@ func readFromRedis(ctx context.Context, rawURL string, out chan<- RedisRecord, c
 		}
 
 		for _, key := range keys {
-			record, err := readKeyToRecord(ctx, client, key)
-			if err != nil {
-				log.Printf("Warning: failed to read key %s: %v", key, err)
-				continue
-			}
-			if record != nil {
-				out <- *record
-				*count++
-				fmt.Printf("\rRead %d of %d keys", *count, totalKeys)
-			}
+			key := key // capture for closure
+			pool.Submit(func() {
+				record, err := readKeyToRecord(ctx, client, key)
+				if err != nil {
+					log.Printf("Warning: failed to read key %s: %v", key, err)
+					return
+				}
+				if record != nil {
+					out <- *record
+					newCount := atomic.AddInt64(&atomicCount, 1)
+					fmt.Printf("\rRead %d of %d keys", newCount, totalKeys)
+				}
+			})
 		}
 
 		cursor = nextCursor
@@ -357,6 +368,10 @@ func readFromRedis(ctx context.Context, rawURL string, out chan<- RedisRecord, c
 			break
 		}
 	}
+
+	// Wait for all workers to finish
+	pool.StopAndWait()
+	*count = atomic.LoadInt64(&atomicCount)
 
 	fmt.Println()
 	return nil
@@ -530,12 +545,28 @@ func writeToRedis(ctx context.Context, rawURL string, in <-chan RedisRecord, cou
 	}
 	fmt.Printf("Destination Redis version: %s\n", version)
 
+	// Create a pool of workers for writing concurrently
+	pool := pond.NewPool(20)
+	var atomicCount int64
+	var writeErr atomic.Value
+
 	for record := range in {
-		if err := writeRecordToRedis(ctx, client, record); err != nil {
-			return fmt.Errorf("failed to write key %s: %w", record.Key, err)
-		}
-		*count++
-		fmt.Printf("\rWritten %d records", *count)
+		record := record // capture for closure
+		pool.Submit(func() {
+			if err := writeRecordToRedis(ctx, client, record); err != nil {
+				writeErr.Store(fmt.Errorf("failed to write key %s: %w", record.Key, err))
+				return
+			}
+			newCount := atomic.AddInt64(&atomicCount, 1)
+			fmt.Printf("\rWritten %d records", newCount)
+		})
+	}
+
+	pool.StopAndWait()
+	*count = atomic.LoadInt64(&atomicCount)
+
+	if err := writeErr.Load(); err != nil {
+		return err.(error)
 	}
 
 	return nil
