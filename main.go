@@ -47,18 +47,27 @@ type StreamEntry struct {
 func main() {
 	from := flag.String("from", "", "Source: Redis URL (redis:// or rediss://) or file path")
 	to := flag.String("to", "", "Destination: Redis URL (redis:// or rediss://) or file path")
+	verify := flag.Bool("verify", false, "Verify mode: compare source and destination instead of syncing")
 	flag.Parse()
 
 	if *from == "" || *to == "" {
-		fmt.Fprintln(os.Stderr, "Usage: redisync -from <source> -to <destination>")
+		fmt.Fprintln(os.Stderr, "Usage: redisync -from <source> -to <destination> [-verify]")
 		fmt.Fprintln(os.Stderr, "  source/destination can be:")
 		fmt.Fprintln(os.Stderr, "    - Redis URL: redis://host:port/db or rediss://host:port/db")
 		fmt.Fprintln(os.Stderr, "    - File path: /path/to/file.jsonl")
+		fmt.Fprintln(os.Stderr, "  -verify: compare source and destination, report differences")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
 	ctx := context.Background()
+
+	if *verify {
+		if err := runVerify(ctx, *from, *to); err != nil {
+			log.Fatalf("Verify error: %v", err)
+		}
+		return
+	}
 
 	// Channel for records
 	recordChan := make(chan RedisRecord, 100)
@@ -104,6 +113,191 @@ func main() {
 
 func isRedisURL(s string) bool {
 	return strings.HasPrefix(s, "redis://") || strings.HasPrefix(s, "rediss://")
+}
+
+// runVerify compares source and destination, reporting any differences
+func runVerify(ctx context.Context, from, to string) error {
+	fmt.Println("Verify mode: comparing source and destination...")
+
+	// Load source records into a map
+	srcRecords := make(map[string]RedisRecord)
+	srcChan := make(chan RedisRecord, 100)
+	var srcCount int64
+
+	srcIsRedis := isRedisURL(from)
+	go func() {
+		var err error
+		if srcIsRedis {
+			err = readFromRedis(ctx, from, srcChan, &srcCount)
+		} else {
+			err = readFromFile(from, srcChan, &srcCount)
+		}
+		if err != nil {
+			log.Printf("Error reading source: %v", err)
+		}
+	}()
+
+	for record := range srcChan {
+		srcRecords[record.Key] = record
+	}
+
+	// Load destination records into a map
+	dstRecords := make(map[string]RedisRecord)
+	dstChan := make(chan RedisRecord, 100)
+	var dstCount int64
+
+	dstIsRedis := isRedisURL(to)
+	go func() {
+		var err error
+		if dstIsRedis {
+			err = readFromRedis(ctx, to, dstChan, &dstCount)
+		} else {
+			err = readFromFile(to, dstChan, &dstCount)
+		}
+		if err != nil {
+			log.Printf("Error reading destination: %v", err)
+		}
+	}()
+
+	for record := range dstChan {
+		dstRecords[record.Key] = record
+	}
+
+	// Compare records
+	var missingInDst, missingInSrc, different int
+	var diffDetails []string
+
+	// Check for keys in source but not in destination, or different
+	for key, srcRec := range srcRecords {
+		dstRec, exists := dstRecords[key]
+		if !exists {
+			missingInDst++
+			diffDetails = append(diffDetails, fmt.Sprintf("  MISSING in destination: %s", key))
+			continue
+		}
+		if !recordsEqual(srcRec, dstRec) {
+			different++
+			diffDetails = append(diffDetails, fmt.Sprintf("  DIFFERENT: %s", key))
+		}
+	}
+
+	// Check for keys in destination but not in source
+	for key := range dstRecords {
+		if _, exists := srcRecords[key]; !exists {
+			missingInSrc++
+			diffDetails = append(diffDetails, fmt.Sprintf("  EXTRA in destination: %s", key))
+		}
+	}
+
+	fmt.Printf("\n\nVerification Results:\n")
+	fmt.Printf("  Source keys:      %d\n", len(srcRecords))
+	fmt.Printf("  Destination keys: %d\n", len(dstRecords))
+	fmt.Printf("  Missing in dest:  %d\n", missingInDst)
+	fmt.Printf("  Extra in dest:    %d\n", missingInSrc)
+	fmt.Printf("  Different values: %d\n", different)
+
+	if len(diffDetails) > 0 {
+		fmt.Println("\nDifferences:")
+		for _, d := range diffDetails {
+			fmt.Println(d)
+		}
+		return fmt.Errorf("verification failed: %d differences found", len(diffDetails))
+	}
+
+	fmt.Println("\nVerification PASSED: source and destination match!")
+	return nil
+}
+
+// recordsEqual compares two RedisRecords for equality
+func recordsEqual(a, b RedisRecord) bool {
+	if a.Key != b.Key || a.Type != b.Type {
+		return false
+	}
+
+	// Compare based on type
+	switch a.Type {
+	case "string":
+		if a.StringValue == nil && b.StringValue == nil {
+			return true
+		}
+		if a.StringValue == nil || b.StringValue == nil {
+			return false
+		}
+		return *a.StringValue == *b.StringValue
+
+	case "list":
+		if len(a.ListValues) != len(b.ListValues) {
+			return false
+		}
+		for i := range a.ListValues {
+			if a.ListValues[i] != b.ListValues[i] {
+				return false
+			}
+		}
+		return true
+
+	case "set":
+		if len(a.SetMembers) != len(b.SetMembers) {
+			return false
+		}
+		aSet := make(map[string]bool, len(a.SetMembers))
+		for _, m := range a.SetMembers {
+			aSet[m] = true
+		}
+		for _, m := range b.SetMembers {
+			if !aSet[m] {
+				return false
+			}
+		}
+		return true
+
+	case "zset":
+		if len(a.ZSetMembers) != len(b.ZSetMembers) {
+			return false
+		}
+		aMap := make(map[string]float64, len(a.ZSetMembers))
+		for _, m := range a.ZSetMembers {
+			aMap[m.Member] = m.Score
+		}
+		for _, m := range b.ZSetMembers {
+			if score, exists := aMap[m.Member]; !exists || score != m.Score {
+				return false
+			}
+		}
+		return true
+
+	case "hash":
+		if len(a.HashFields) != len(b.HashFields) {
+			return false
+		}
+		for k, v := range a.HashFields {
+			if bv, exists := b.HashFields[k]; !exists || bv != v {
+				return false
+			}
+		}
+		return true
+
+	case "stream":
+		if len(a.StreamItems) != len(b.StreamItems) {
+			return false
+		}
+		for i := range a.StreamItems {
+			if a.StreamItems[i].ID != b.StreamItems[i].ID {
+				return false
+			}
+			if len(a.StreamItems[i].Values) != len(b.StreamItems[i].Values) {
+				return false
+			}
+			for k, v := range a.StreamItems[i].Values {
+				if bv, exists := b.StreamItems[i].Values[k]; !exists || bv != v {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	return false
 }
 
 // readFromRedis reads all keys from Redis and sends them as RedisRecords to the channel

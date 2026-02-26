@@ -409,3 +409,233 @@ func TestParseRedisURLWithDB(t *testing.T) {
 		})
 	}
 }
+
+func TestRecordsEqual(t *testing.T) {
+	tests := []struct {
+		name     string
+		a        RedisRecord
+		b        RedisRecord
+		expected bool
+	}{
+		{
+			name:     "equal strings",
+			a:        RedisRecord{Key: "k", Type: "string", StringValue: strPtr("hello")},
+			b:        RedisRecord{Key: "k", Type: "string", StringValue: strPtr("hello")},
+			expected: true,
+		},
+		{
+			name:     "different strings",
+			a:        RedisRecord{Key: "k", Type: "string", StringValue: strPtr("hello")},
+			b:        RedisRecord{Key: "k", Type: "string", StringValue: strPtr("world")},
+			expected: false,
+		},
+		{
+			name:     "nil vs non-nil string",
+			a:        RedisRecord{Key: "k", Type: "string", StringValue: nil},
+			b:        RedisRecord{Key: "k", Type: "string", StringValue: strPtr("hello")},
+			expected: false,
+		},
+		{
+			name:     "both nil strings",
+			a:        RedisRecord{Key: "k", Type: "string", StringValue: nil},
+			b:        RedisRecord{Key: "k", Type: "string", StringValue: nil},
+			expected: true,
+		},
+		{
+			name:     "different types",
+			a:        RedisRecord{Key: "k", Type: "string", StringValue: strPtr("hello")},
+			b:        RedisRecord{Key: "k", Type: "list", ListValues: []string{"hello"}},
+			expected: false,
+		},
+		{
+			name:     "equal lists",
+			a:        RedisRecord{Key: "k", Type: "list", ListValues: []string{"a", "b", "c"}},
+			b:        RedisRecord{Key: "k", Type: "list", ListValues: []string{"a", "b", "c"}},
+			expected: true,
+		},
+		{
+			name:     "different list length",
+			a:        RedisRecord{Key: "k", Type: "list", ListValues: []string{"a", "b"}},
+			b:        RedisRecord{Key: "k", Type: "list", ListValues: []string{"a", "b", "c"}},
+			expected: false,
+		},
+		{
+			name:     "different list order",
+			a:        RedisRecord{Key: "k", Type: "list", ListValues: []string{"a", "b", "c"}},
+			b:        RedisRecord{Key: "k", Type: "list", ListValues: []string{"c", "b", "a"}},
+			expected: false,
+		},
+		{
+			name:     "equal sets",
+			a:        RedisRecord{Key: "k", Type: "set", SetMembers: []string{"a", "b", "c"}},
+			b:        RedisRecord{Key: "k", Type: "set", SetMembers: []string{"c", "b", "a"}},
+			expected: true,
+		},
+		{
+			name:     "different sets",
+			a:        RedisRecord{Key: "k", Type: "set", SetMembers: []string{"a", "b", "c"}},
+			b:        RedisRecord{Key: "k", Type: "set", SetMembers: []string{"a", "b", "d"}},
+			expected: false,
+		},
+		{
+			name:     "equal zsets",
+			a:        RedisRecord{Key: "k", Type: "zset", ZSetMembers: []ZSetMember{{Member: "a", Score: 1.0}, {Member: "b", Score: 2.0}}},
+			b:        RedisRecord{Key: "k", Type: "zset", ZSetMembers: []ZSetMember{{Member: "b", Score: 2.0}, {Member: "a", Score: 1.0}}},
+			expected: true,
+		},
+		{
+			name:     "different zset scores",
+			a:        RedisRecord{Key: "k", Type: "zset", ZSetMembers: []ZSetMember{{Member: "a", Score: 1.0}}},
+			b:        RedisRecord{Key: "k", Type: "zset", ZSetMembers: []ZSetMember{{Member: "a", Score: 2.0}}},
+			expected: false,
+		},
+		{
+			name:     "equal hashes",
+			a:        RedisRecord{Key: "k", Type: "hash", HashFields: map[string]string{"f1": "v1", "f2": "v2"}},
+			b:        RedisRecord{Key: "k", Type: "hash", HashFields: map[string]string{"f2": "v2", "f1": "v1"}},
+			expected: true,
+		},
+		{
+			name:     "different hashes",
+			a:        RedisRecord{Key: "k", Type: "hash", HashFields: map[string]string{"f1": "v1"}},
+			b:        RedisRecord{Key: "k", Type: "hash", HashFields: map[string]string{"f1": "v2"}},
+			expected: false,
+		},
+		{
+			name: "equal streams",
+			a: RedisRecord{Key: "k", Type: "stream", StreamItems: []StreamEntry{
+				{ID: "1-0", Values: map[string]string{"k": "v"}},
+			}},
+			b: RedisRecord{Key: "k", Type: "stream", StreamItems: []StreamEntry{
+				{ID: "1-0", Values: map[string]string{"k": "v"}},
+			}},
+			expected: true,
+		},
+		{
+			name: "different stream IDs",
+			a: RedisRecord{Key: "k", Type: "stream", StreamItems: []StreamEntry{
+				{ID: "1-0", Values: map[string]string{"k": "v"}},
+			}},
+			b: RedisRecord{Key: "k", Type: "stream", StreamItems: []StreamEntry{
+				{ID: "2-0", Values: map[string]string{"k": "v"}},
+			}},
+			expected: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := recordsEqual(tc.a, tc.b)
+			if result != tc.expected {
+				t.Errorf("recordsEqual() = %v, expected %v", result, tc.expected)
+			}
+		})
+	}
+}
+
+func strPtr(s string) *string {
+	return &s
+}
+
+func TestVerifyMode(t *testing.T) {
+	ctx := context.Background()
+
+	srcClient := newRedisClient(sourceDB)
+	dstClient := newRedisClient(destDB)
+	defer srcClient.Close()
+	defer dstClient.Close()
+
+	// Verify connection
+	if err := srcClient.Ping(ctx).Err(); err != nil {
+		t.Skipf("Cannot connect to Redis source DB %d: %v", sourceDB, err)
+	}
+	if err := dstClient.Ping(ctx).Err(); err != nil {
+		t.Skipf("Cannot connect to Redis dest DB %d: %v", destDB, err)
+	}
+
+	// Test case 1: Matching databases
+	t.Run("matching databases", func(t *testing.T) {
+		flushDB(t, srcClient)
+		flushDB(t, dstClient)
+
+		// Add same data to both
+		srcClient.Set(ctx, "test:key1", "value1", 0)
+		srcClient.Set(ctx, "test:key2", "value2", 0)
+		dstClient.Set(ctx, "test:key1", "value1", 0)
+		dstClient.Set(ctx, "test:key2", "value2", 0)
+
+		cmd := exec.Command("go", "run", "main.go",
+			"-from", "redis://127.0.0.1/13",
+			"-to", "redis://127.0.0.1/14",
+			"-verify",
+		)
+		output, err := cmd.CombinedOutput()
+		t.Logf("verify output:\n%s", string(output))
+		if err != nil {
+			t.Errorf("verify should pass for matching databases: %v", err)
+		}
+	})
+
+	// Test case 2: Missing key in destination
+	t.Run("missing key in destination", func(t *testing.T) {
+		flushDB(t, srcClient)
+		flushDB(t, dstClient)
+
+		srcClient.Set(ctx, "test:key1", "value1", 0)
+		srcClient.Set(ctx, "test:key2", "value2", 0)
+		dstClient.Set(ctx, "test:key1", "value1", 0)
+		// key2 missing in destination
+
+		cmd := exec.Command("go", "run", "main.go",
+			"-from", "redis://127.0.0.1/13",
+			"-to", "redis://127.0.0.1/14",
+			"-verify",
+		)
+		output, err := cmd.CombinedOutput()
+		t.Logf("verify output:\n%s", string(output))
+		if err == nil {
+			t.Error("verify should fail when key is missing in destination")
+		}
+	})
+
+	// Test case 3: Extra key in destination
+	t.Run("extra key in destination", func(t *testing.T) {
+		flushDB(t, srcClient)
+		flushDB(t, dstClient)
+
+		srcClient.Set(ctx, "test:key1", "value1", 0)
+		dstClient.Set(ctx, "test:key1", "value1", 0)
+		dstClient.Set(ctx, "test:extra", "extra", 0)
+
+		cmd := exec.Command("go", "run", "main.go",
+			"-from", "redis://127.0.0.1/13",
+			"-to", "redis://127.0.0.1/14",
+			"-verify",
+		)
+		output, err := cmd.CombinedOutput()
+		t.Logf("verify output:\n%s", string(output))
+		if err == nil {
+			t.Error("verify should fail when extra key exists in destination")
+		}
+	})
+
+	// Test case 4: Different values
+	t.Run("different values", func(t *testing.T) {
+		flushDB(t, srcClient)
+		flushDB(t, dstClient)
+
+		srcClient.Set(ctx, "test:key1", "value1", 0)
+		dstClient.Set(ctx, "test:key1", "different", 0)
+
+		cmd := exec.Command("go", "run", "main.go",
+			"-from", "redis://127.0.0.1/13",
+			"-to", "redis://127.0.0.1/14",
+			"-verify",
+		)
+		output, err := cmd.CombinedOutput()
+		t.Logf("verify output:\n%s", string(output))
+		if err == nil {
+			t.Error("verify should fail when values differ")
+		}
+	})
+}
